@@ -7,9 +7,7 @@ on:
         description: "Promote to environment"
         type: choice
         required: true
-        options:
-          - stage
-          - prod
+        options: [stage, prod]
 
 concurrency:
   group: supabase-promote
@@ -18,7 +16,6 @@ concurrency:
 jobs:
   plan-and-backup:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -26,73 +23,74 @@ jobs:
         with:
           version: latest
 
-      - name: Select source/target
-        id: vars
-        shell: bash
-        run: |
-          if [ "${{ inputs.target_env }}" = "stage" ]; then
-            echo "SRC_NAME=dev" >> $GITHUB_OUTPUT
-            echo "TGT_NAME=stage" >> $GITHUB_OUTPUT
-            echo "SRC_DB_URL=${{ secrets.DEV_DB_URL }}" >> $GITHUB_OUTPUT
-            echo "TGT_DB_URL=${{ secrets.STAGE_DB_URL }}" >> $GITHUB_OUTPUT
-            echo "TGT_PROJECT_REF=${{ secrets.STAGE_PROJECT_REF }}" >> $GITHUB_OUTPUT
-          else
-            echo "SRC_NAME=stage" >> $GITHUB_OUTPUT
-            echo "TGT_NAME=prod" >> $GITHUB_OUTPUT
-            echo "SRC_DB_URL=${{ secrets.STAGE_DB_URL }}" >> $GITHUB_OUTPUT
-            echo "TGT_DB_URL=${{ secrets.PROD_DB_URL }}" >> $GITHUB_OUTPUT
-            echo "TGT_PROJECT_REF=${{ secrets.PROD_PROJECT_REF }}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Block data-changing SQL in migrations
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           if ls supabase/migrations/*.sql >/dev/null 2>&1; then
-            if grep -RInE '(^|[[:space:]])(insert|update|delete|truncate|copy)[[:space:]]' supabase/migrations; then
+            if grep -RInE '(^|[[:space:]])(insert|update|delete|truncate|copy|merge)[[:space:]]' supabase/migrations; then
               echo "❌ Data-changing SQL detected in migrations. Pipeline is schema-only."
               exit 1
             fi
           fi
 
-      - name: Backup source + target schemas
+      # ---------- BACKUP + DIFF (STAGE) ----------
+      - name: Backup dev + stage schemas
+        if: ${{ inputs.target_env == 'stage' }}
         env:
           DEV_DB_URL: ${{ secrets.DEV_DB_URL }}
+          STAGE_DB_URL: ${{ secrets.STAGE_DB_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p backups
+          : "${DEV_DB_URL:?DEV_DB_URL missing}"
+          : "${STAGE_DB_URL:?STAGE_DB_URL missing}"
+
+          supabase db dump --db-url "$DEV_DB_URL"   -f "backups/dev_schema.sql"
+          supabase db dump --db-url "$STAGE_DB_URL" -f "backups/stage_schema.sql"
+
+          diff -u backups/stage_schema.sql backups/dev_schema.sql \
+            | tee backups/dev_to_stage.diff || true
+
+      - name: Plan migrations (dry-run) -> stage
+        if: ${{ inputs.target_env == 'stage' }}
+        env:
+          STAGE_DB_URL: ${{ secrets.STAGE_DB_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${STAGE_DB_URL:?STAGE_DB_URL missing}"
+          supabase db push --db-url "$STAGE_DB_URL" --dry-run
+
+      # ---------- BACKUP + DIFF (PROD) ----------
+      - name: Backup stage + prod schemas
+        if: ${{ inputs.target_env == 'prod' }}
+        env:
           STAGE_DB_URL: ${{ secrets.STAGE_DB_URL }}
           PROD_DB_URL: ${{ secrets.PROD_DB_URL }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p backups
+          : "${STAGE_DB_URL:?STAGE_DB_URL missing}"
+          : "${PROD_DB_URL:?PROD_DB_URL missing}"
 
-          if [[ "${{ inputs.target_env }}" == "stage" ]]; then
-            : "${DEV_DB_URL:?DEV_DB_URL secret missing}"
-            : "${STAGE_DB_URL:?STAGE_DB_URL secret missing}"
+          supabase db dump --db-url "$STAGE_DB_URL" -f "backups/stage_schema.sql"
+          supabase db dump --db-url "$PROD_DB_URL"  -f "backups/prod_schema.sql"
 
-            supabase db dump --db-url "$DEV_DB_URL"   -f "backups/dev_schema.sql"
-            supabase db dump --db-url "$STAGE_DB_URL" -f "backups/stage_schema.sql"
-          else
-            : "${STAGE_DB_URL:?STAGE_DB_URL secret missing}"
-            : "${PROD_DB_URL:?PROD_DB_URL secret missing}"
+          diff -u backups/prod_schema.sql backups/stage_schema.sql \
+            | tee backups/stage_to_prod.diff || true
 
-            supabase db dump --db-url "$STAGE_DB_URL" -f "backups/stage_schema.sql"
-            supabase db dump --db-url "$PROD_DB_URL"  -f "backups/prod_schema.sql"
-          fi
-      - name: Diff schemas (for review)
-        shell: bash
-        run: |
-          set -e
-          diff -u "backups/${{ steps.vars.outputs.TGT_NAME }}_schema.sql" \
-                "backups/${{ steps.vars.outputs.SRC_NAME }}_schema.sql" \
-            | tee "backups/${{ steps.vars.outputs.SRC_NAME }}_to_${{ steps.vars.outputs.TGT_NAME }}.diff" || true
-
-      - name: Plan migrations (dry-run)
+      - name: Plan migrations (dry-run) -> prod
+        if: ${{ inputs.target_env == 'prod' }}
         env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROD_DB_URL: ${{ secrets.PROD_DB_URL }}
         shell: bash
         run: |
-          # Shows which migrations would be applied to target, but does not apply them
-          supabase db push --db-url "${{ steps.vars.outputs.TGT_DB_URL }}" --dry-run
+          set -euo pipefail
+          : "${PROD_DB_URL:?PROD_DB_URL missing}"
+          supabase db push --db-url "$PROD_DB_URL" --dry-run
 
       - uses: actions/upload-artifact@v4
         with:
@@ -102,7 +100,7 @@ jobs:
   apply:
     needs: plan-and-backup
     runs-on: ubuntu-latest
-    environment: ${{ inputs.target_env }} # <-- prod approvals happen here if you set required reviewers
+    environment: ${{ inputs.target_env }}
 
     steps:
       - uses: actions/checkout@v4
@@ -111,30 +109,46 @@ jobs:
         with:
           version: latest
 
-      - name: Select target (again)
-        id: vars
+      # ---------- APPLY (STAGE) ----------
+      - name: Apply schema migrations to stage (NO seed)
+        if: ${{ inputs.target_env == 'stage' }}
+        env:
+          STAGE_DB_URL: ${{ secrets.STAGE_DB_URL }}
         shell: bash
         run: |
-          if [ "${{ inputs.target_env }}" = "stage" ]; then
-            echo "TGT_DB_URL=${{ secrets.STAGE_DB_URL }}" >> $GITHUB_OUTPUT
-            echo "TGT_PROJECT_REF=${{ secrets.STAGE_PROJECT_REF }}" >> $GITHUB_OUTPUT
-          else
-            echo "TGT_DB_URL=${{ secrets.PROD_DB_URL }}" >> $GITHUB_OUTPUT
-            echo "TGT_PROJECT_REF=${{ secrets.PROD_PROJECT_REF }}" >> $GITHUB_OUTPUT
-          fi
+          set -euo pipefail
+          : "${STAGE_DB_URL:?STAGE_DB_URL missing}"
+          supabase db push --db-url "$STAGE_DB_URL"
 
-      - name: Apply schema migrations (NO seed)
+      - name: Deploy Edge Functions to stage
+        if: ${{ inputs.target_env == 'stage' }}
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          STAGE_PROJECT_REF: ${{ secrets.STAGE_PROJECT_REF }}
         shell: bash
         run: |
-          # Applies only migrations tracked in supabase/migrations
-          # NOTE: do NOT pass --include-seed (keeps it schema-only)
-          supabase db push --db-url "${{ steps.vars.outputs.TGT_DB_URL }}"
+          set -euo pipefail
+          : "${STAGE_PROJECT_REF:?STAGE_PROJECT_REF missing}"
+          supabase functions deploy --project-ref "$STAGE_PROJECT_REF"
 
-      - name: Deploy Edge Functions
+      # ---------- APPLY (PROD) ----------
+      - name: Apply schema migrations to prod (NO seed)
+        if: ${{ inputs.target_env == 'prod' }}
+        env:
+          PROD_DB_URL: ${{ secrets.PROD_DB_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PROD_DB_URL:?PROD_DB_URL missing}"
+          supabase db push --db-url "$PROD_DB_URL"
+
+      - name: Deploy Edge Functions to prod
+        if: ${{ inputs.target_env == 'prod' }}
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROD_PROJECT_REF: ${{ secrets.PROD_PROJECT_REF }}
         shell: bash
         run: |
-          supabase functions deploy --project-ref "${{ steps.vars.outputs.TGT_PROJECT_REF }}"
+          set -euo pipefail
+          : "${PROD_PROJECT_REF:?PROD_PROJECT_REF missing}"
+          supabase functions deploy --project-ref "$PROD_PROJECT_REF"
