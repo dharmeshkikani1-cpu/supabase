@@ -55,15 +55,29 @@ jobs:
             fi
           fi
 
-      - name: Backup SOURCE + TARGET (schema-only)
+      - name: Backup source + target schemas
         env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          DEV_DB_URL: ${{ secrets.DEV_DB_URL }}
+          STAGE_DB_URL: ${{ secrets.STAGE_DB_URL }}
+          PROD_DB_URL: ${{ secrets.PROD_DB_URL }}
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p backups
-          supabase db dump --db-url "${{ steps.vars.outputs.SRC_DB_URL }}" -f "backups/${{ steps.vars.outputs.SRC_NAME }}_schema.sql"
-          supabase db dump --db-url "${{ steps.vars.outputs.TGT_DB_URL }}" -f "backups/${{ steps.vars.outputs.TGT_NAME }}_schema.sql"
 
+          if [[ "${{ inputs.target_env }}" == "stage" ]]; then
+            : "${DEV_DB_URL:?DEV_DB_URL secret missing}"
+            : "${STAGE_DB_URL:?STAGE_DB_URL secret missing}"
+
+            supabase db dump --db-url "$DEV_DB_URL"   -f "backups/dev_schema.sql"
+            supabase db dump --db-url "$STAGE_DB_URL" -f "backups/stage_schema.sql"
+          else
+            : "${STAGE_DB_URL:?STAGE_DB_URL secret missing}"
+            : "${PROD_DB_URL:?PROD_DB_URL secret missing}"
+
+            supabase db dump --db-url "$STAGE_DB_URL" -f "backups/stage_schema.sql"
+            supabase db dump --db-url "$PROD_DB_URL"  -f "backups/prod_schema.sql"
+          fi
       - name: Diff schemas (for review)
         shell: bash
         run: |
